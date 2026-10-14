@@ -10,7 +10,6 @@
 #include <ncurses.h>
 
 #define MAX_PATH 512
-#define BYTES_PER_ROW 16
 
 #define CP_BORDER 1
 #define CP_TITLE  2
@@ -30,6 +29,7 @@ void get_model_and_serial(const char *dev_name, char *dest, size_t max_len);
 int get_drive_list(drive_info_t drives[], int max_drives);
 void close_drives(drive_info_t drives[], int count);
 void render_hex_view(WINDOW *win, drive_info_t *drive);
+int get_dynamic_bytes_per_row(WINDOW *win);
 
 int main(int argc, char *argv[]) {
     drive_info_t drives[64];
@@ -144,7 +144,7 @@ int main(int argc, char *argv[]) {
         }
         wrefresh(win_left);
 
-        // --- Render Right Pane (Hex & ASCII View) ---
+        // --- Render Right Pane (Dynamic Hex & ASCII View) ---
         if (drive_count > 0) {
             render_hex_view(win_right, &drives[selected_drive]);
         } else {
@@ -191,7 +191,9 @@ int main(int argc, char *argv[]) {
         int right_rows, right_cols;
         getmaxyx(win_right, right_rows, right_cols);
         int rows_visible = right_rows - 2;
-        off_t page_bytes = rows_visible * BYTES_PER_ROW;
+        if (rows_visible < 1) rows_visible = 1;
+        int dynamic_bpr = get_dynamic_bytes_per_row(win_right);
+        off_t page_bytes = rows_visible * dynamic_bpr;
 
         switch (ch) {
             case KEY_DOWN:
@@ -387,19 +389,36 @@ int get_drive_list(drive_info_t drives[], int max_drives) {
     return count;
 }
 
+int get_dynamic_bytes_per_row(WINDOW *win) {
+    int rows, cols;
+    getmaxyx(win, rows, cols);
+    int inner_width = cols - 4; // account for borders/margins
+    if (inner_width < 32) inner_width = 32;
+
+    // Row format: "%012lX:  %s   %s"
+    // Fixed overhead per row: 14 chars (address + colon/spaces) + 2 separator spaces = 16 chars.
+    // Each byte takes 3 chars in hex + 1 char in ASCII = 4 chars total per byte.
+    int bpr = (inner_width - 16) / 4;
+    if (bpr < 4) bpr = 4;       // minimum safety limit
+    if (bpr > 128) bpr = 128;   // upper safety limit
+    return bpr;
+}
+
 void render_hex_view(WINDOW *win, drive_info_t *drive) {
     int rows, cols;
     getmaxyx(win, rows, cols);
     int display_rows = rows - 2;
     if (display_rows < 1) display_rows = 1;
 
-    unsigned char *buffer = malloc(display_rows * BYTES_PER_ROW);
+    int bytes_per_row = get_dynamic_bytes_per_row(win);
+
+    unsigned char *buffer = malloc(display_rows * bytes_per_row);
     if (!buffer) return;
-    memset(buffer, 0, display_rows * BYTES_PER_ROW);
+    memset(buffer, 0, display_rows * bytes_per_row);
 
     if (drive->fd >= 0) {
         lseek(drive->fd, drive->offset, SEEK_SET);
-        read(drive->fd, buffer, display_rows * BYTES_PER_ROW);
+        read(drive->fd, buffer, display_rows * bytes_per_row);
     }
 
     wclear(win);
@@ -412,21 +431,29 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
     mvwprintw(win, 0, 2, " Hex View: %s (Offset: 0x%012lX) ", drive->path, drive->offset);
     wattroff(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
 
+    char *hex_buf = malloc(bytes_per_row * 3 + 1);
+    char *ascii_buf = malloc(bytes_per_row + 1);
+    if (!hex_buf || !ascii_buf) {
+        free(buffer);
+        free(hex_buf);
+        free(ascii_buf);
+        return;
+    }
+
     for (int i = 0; i < display_rows; i++) {
-        off_t row_addr = drive->offset + (i * BYTES_PER_ROW);
+        off_t row_addr = drive->offset + (i * bytes_per_row);
         if (row_addr >= drive->size) break;
 
-        char hex_buf[64] = {0};
-        char ascii_buf[20] = {0};
+        hex_buf[0] = '\0';
+        ascii_buf[0] = '\0';
 
-        for (int j = 0; j < BYTES_PER_ROW; j++) {
-            int idx = (i * BYTES_PER_ROW) + j;
+        for (int j = 0; j < bytes_per_row; j++) {
+            int idx = (i * bytes_per_row) + j;
             unsigned char c = buffer[idx];
             char byte_str[4];
             sprintf(byte_str, "%02X ", c);
             strcat(hex_buf, byte_str);
 
-            // Standard printable ASCII check (0x7C / '|' renders naturally as a pipe)
             if (c >= 32 && c <= 126) {
                 sprintf(ascii_buf + strlen(ascii_buf), "%c", c);
             } else {
@@ -434,10 +461,16 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
             }
         }
 
-        // Output hex and clean ASCII text without outer framing pipe wrappers
-        mvwprintw(win, i + 1, 2, "%012lX:  %-48s   %s", row_addr, hex_buf, ascii_buf);
+        // Output hex with dynamic width padding and clean ASCII text
+        mvwprintw(win, i + 1, 2, "%012lX:  %-*s   %s",
+                  row_addr,
+                  bytes_per_row * 3,
+                  hex_buf,
+                  ascii_buf);
     }
 
+    free(hex_buf);
+    free(ascii_buf);
     free(buffer);
     wrefresh(win);
 }
