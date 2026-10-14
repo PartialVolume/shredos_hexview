@@ -30,6 +30,7 @@ int get_drive_list(drive_info_t drives[], int max_drives);
 void close_drives(drive_info_t drives[], int count);
 void render_hex_view(WINDOW *win, drive_info_t *drive);
 int get_dynamic_bytes_per_row(WINDOW *win);
+off_t handle_goto_popup(drive_info_t *drive, int bytes_per_row);
 
 int main(int argc, char *argv[]) {
     drive_info_t drives[64];
@@ -158,7 +159,7 @@ int main(int argc, char *argv[]) {
 
         // --- Render Frameless Help Bar on Bottom Line ---
         wclear(win_help);
-        mvwprintw(win_help, 0, 0, "   r=Reload Devices | PgUp/PgDn=Scroll | <=Start | >=End | q=Quit");
+        mvwprintw(win_help, 0, 0, "   r=Reload Devices | g=goto | PgUp/PgDn=Scroll Hex View | <=Start | >=End | q=Quit");
         wrefresh(win_help);
 
         // --- Handle Input (Blocking) ---
@@ -235,6 +236,13 @@ int main(int argc, char *argv[]) {
                     } else {
                         drives[selected_drive].offset = 0;
                     }
+                }
+                break;
+
+            case 'g':
+            case 'G':
+                if (drive_count > 0) {
+                    drives[selected_drive].offset = handle_goto_popup(&drives[selected_drive], dynamic_bpr);
                 }
                 break;
 
@@ -395,13 +403,96 @@ int get_dynamic_bytes_per_row(WINDOW *win) {
     int inner_width = cols - 4; // account for borders/margins
     if (inner_width < 32) inner_width = 32;
 
-    // Row format: "%012lX:  %s   %s"
-    // Fixed overhead per row: 14 chars (address + colon/spaces) + 2 separator spaces = 16 chars.
-    // Each byte takes 3 chars in hex + 1 char in ASCII = 4 chars total per byte.
     int bpr = (inner_width - 16) / 4;
-    if (bpr < 4) bpr = 4;       // minimum safety limit
-    if (bpr > 128) bpr = 128;   // upper safety limit
+    if (bpr < 4) bpr = 4;
+    if (bpr > 128) bpr = 128;
     return bpr;
+}
+
+off_t handle_goto_popup(drive_info_t *drive, int bytes_per_row) {
+    int p_height = 9;
+    int p_width = 54;
+    int starty = (LINES - p_height) / 2;
+    int startx = (COLS - p_width) / 2;
+
+    WINDOW *pop = newwin(p_height, p_width, starty, startx);
+    keypad(pop, TRUE);
+
+    box(pop, 0, 0);
+    wattron(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+    mvwprintw(pop, 0, 2, " Go To ");
+    wattroff(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+    mvwprintw(pop, 2, 3, "Select Goto Method:");
+    mvwprintw(pop, 4, 5, "[P] Percentage of disk (0-100%%)");
+    mvwprintw(pop, 5, 5, "[B] Offset bytes (Decimal / Hex)");
+    mvwprintw(pop, 6, 5, "[Esc] Cancel");
+    wrefresh(pop);
+
+    int ch = wgetch(pop);
+    off_t new_offset = drive->offset;
+
+    if (ch == 'p' || ch == 'P') {
+        wclear(pop);
+        box(pop, 0, 0);
+        wattron(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        mvwprintw(pop, 0, 2, " Go To: Percentage ");
+        wattroff(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+        char input_buf[32] = {0};
+        mvwprintw(pop, 3, 3, "Enter percentage (0-100): ");
+        wrefresh(pop);
+
+        echo();
+        curs_set(1);
+        wgetnstr(pop, input_buf, 31);
+        noecho();
+        curs_set(0);
+
+        double percent = atof(input_buf);
+        if (percent < 0.0) percent = 0.0;
+        if (percent > 100.0) percent = 100.0;
+        new_offset = (off_t)(((double)drive->size * percent) / 100.0);
+    }
+    else if (ch == 'b' || ch == 'B') {
+        wclear(pop);
+        box(pop, 0, 0);
+        wattron(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        mvwprintw(pop, 0, 2, " Go To: Byte Offset ");
+        wattroff(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+        char input_buf[64] = {0};
+        mvwprintw(pop, 3, 3, "Enter offset (e.g. 0x1000 or 4096): ");
+        wrefresh(pop);
+
+        echo();
+        curs_set(1);
+        wgetnstr(pop, input_buf, 63);
+        noecho();
+        curs_set(0);
+
+        unsigned long long val = 0;
+        if (strncmp(input_buf, "0x", 2) == 0 || strncmp(input_buf, "0X", 2) == 0) {
+            sscanf(input_buf, "%llx", &val);
+        } else {
+            sscanf(input_buf, "%llu", &val);
+        }
+        new_offset = (off_t)val;
+    }
+
+    delwin(pop);
+    touchwin(stdscr);
+
+    // Clamp and align to row boundary
+    if (new_offset > drive->size) {
+        new_offset = drive->size;
+    }
+    new_offset = (new_offset / bytes_per_row) * bytes_per_row;
+    if (new_offset < 0) {
+        new_offset = 0;
+    }
+
+    return new_offset;
 }
 
 void render_hex_view(WINDOW *win, drive_info_t *drive) {
@@ -426,9 +517,9 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
     box(win, 0, 0);
     wattroff(win, COLOR_PAIR(CP_BORDER));
 
-    // Render pane title in matching hot pink
+    // Render pane title
     wattron(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
-    mvwprintw(win, 0, 2, " Hex View: %s (Offset: 0x%012lX) ", drive->path, drive->offset);
+    mvwprintw(win, 0, 2, " Hex View: %s, Offset: 0x%012lX ", drive->name, drive->offset);
     wattroff(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
 
     char *hex_buf = malloc(bytes_per_row * 3 + 1);
@@ -461,7 +552,6 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
             }
         }
 
-        // Output hex with dynamic width padding and clean ASCII text
         mvwprintw(win, i + 1, 2, "%012lX:  %-*s   %s",
                   row_addr,
                   bytes_per_row * 3,
