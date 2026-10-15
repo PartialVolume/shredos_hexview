@@ -1,4 +1,4 @@
-# shredos_hexview
+# shredos_hexviewer
 Hex/ascii viewer for ShredOS
 
 ## How To Compile
@@ -13,7 +13,9 @@ sudo dnf install ncurses-devel
 ```
 #### then
 ```
-gcc shredos_hexview.c -o shredos_hexview -lncurses. 
+./autogen.sh
+./configure
+make
 ```
 ## Main Screen
 <img width="1143" height="423" alt="Screenshot_20261015_171131" src="https://github.com/user-attachments/assets/166b8a9f-80e6-4084-836b-6360dd4bb042" />
