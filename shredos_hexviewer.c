@@ -9,6 +9,7 @@
 #include <linux/fs.h>
 #include <ncurses.h>
 #include <time.h>
+#include <sys/types.h>
 
 #define MAX_PATH 512
 
@@ -36,6 +37,9 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row);
 void show_message_popup(const char *title, const char *msg);
 
 int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+
     drive_info_t drives[64];
     int drive_count = 0;
     int selected_drive = 0;
@@ -47,6 +51,14 @@ int main(int argc, char *argv[]) {
 
     // Initialize ncurses & colors
     init_ncurses_ui();
+
+    // Check for root privileges
+    if (geteuid() != 0) {
+        show_message_popup("Permission Denied", "Root privileges required! Please run with sudo.");
+        endwin();
+        fprintf(stderr, "Error: shredos_hexviewer must be run as root (sudo).\n");
+        return 1;
+    }
 
     // Initial drive discovery
     drive_count = get_drive_list(drives, 64);
@@ -78,7 +90,10 @@ int main(int argc, char *argv[]) {
         char selected_name[64] = "";
         off_t saved_offset = 0;
         if (drive_count > 0 && selected_drive < drive_count) {
-            strncpy(selected_name, drives[selected_drive].name, sizeof(selected_name));
+            size_t name_len = strlen(drives[selected_drive].name);
+            if (name_len >= sizeof(selected_name)) name_len = sizeof(selected_name) - 1;
+            memcpy(selected_name, drives[selected_drive].name, name_len);
+            selected_name[name_len] = '\0';
             saved_offset = drives[selected_drive].offset;
         }
 
@@ -116,7 +131,7 @@ int main(int argc, char *argv[]) {
         wattroff(win_title, COLOR_PAIR(CP_BORDER));
 
         wattron(win_title, COLOR_PAIR(CP_TITLE) | A_BOLD);
-        mvwprintw(win_title, 1, 2, " ShredOS hex/ascii viewer v1.1");
+        mvwprintw(win_title, 1, 2, " shredos_hexviewer v1.1");
         wattroff(win_title, COLOR_PAIR(CP_TITLE) | A_BOLD);
         wrefresh(win_title);
 
@@ -231,8 +246,10 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        int right_rows, right_cols;
+        int right_rows;
+        int right_cols;
         getmaxyx(win_right, right_rows, right_cols);
+        (void)right_cols; // intentionally unused
         int rows_visible = right_rows - 2;
         if (rows_visible < 1) rows_visible = 1;
         int dynamic_bpr = get_dynamic_bytes_per_row(win_right);
@@ -405,8 +422,22 @@ int get_drive_list(drive_info_t drives[], int max_drives) {
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue; // Skip if currently unreadable/locked
 
-        strncpy(drives[count].name, entry->d_name, sizeof(drives[count].name));
-        strncpy(drives[count].path, path, MAX_PATH);
+        // Safe name copy without format-truncation warnings
+        size_t name_len = strlen(entry->d_name);
+        if (name_len >= sizeof(drives[count].name)) {
+            name_len = sizeof(drives[count].name) - 1;
+        }
+        memcpy(drives[count].name, entry->d_name, name_len);
+        drives[count].name[name_len] = '\0';
+
+        // Safe path copy
+        size_t path_len = strlen(path);
+        if (path_len >= sizeof(drives[count].path)) {
+            path_len = sizeof(drives[count].path) - 1;
+        }
+        memcpy(drives[count].path, path, path_len);
+        drives[count].path[path_len] = '\0';
+
         drives[count].offset = 0;
 
         // Fetch Model / Serial string
@@ -423,8 +454,10 @@ int get_drive_list(drive_info_t drives[], int max_drives) {
 }
 
 int get_dynamic_bytes_per_row(WINDOW *win) {
-    int rows, cols;
+    int rows;
+    int cols;
     getmaxyx(win, rows, cols);
+    (void)rows; // intentionally unused
     int inner_width = cols - 4; // account for borders/margins
     if (inner_width < 32) inner_width = 32;
 
@@ -807,8 +840,10 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
 }
 
 void render_hex_view(WINDOW *win, drive_info_t *drive) {
-    int rows, cols;
+    int rows;
+    int cols;
     getmaxyx(win, rows, cols);
+    (void)cols; // intentionally unused
     int display_rows = rows - 2;
     if (display_rows < 1) display_rows = 1;
 
@@ -820,7 +855,8 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
 
     if (drive->fd >= 0) {
         lseek(drive->fd, drive->offset, SEEK_SET);
-        read(drive->fd, buffer, display_rows * bytes_per_row);
+        ssize_t bytes_read = read(drive->fd, buffer, display_rows * bytes_per_row);
+        (void)bytes_read;
     }
 
     wclear(win);
