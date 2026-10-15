@@ -18,7 +18,7 @@ gcc shredos_hexview.c -o shredos_hexview -lncurses.
 ## Main Screen
 <img width="1143" height="423" alt="Screenshot_20261015_171131" src="https://github.com/user-attachments/assets/166b8a9f-80e6-4084-836b-6360dd4bb042" />
 
-## Search - search for non zero data, full sequential or random chunk with selectable scope, percentage, MB, GB
+## Search for non zero data - full sequential or random chunk with selectable scope, percentage, MB, GB
 <img width="1143" height="423" alt="Screenshot_20261015_171404" src="https://github.com/user-attachments/assets/4f66a85b-daed-4282-b0ec-511db5172c1f" />
 
 ## Goto - percentage or offset
