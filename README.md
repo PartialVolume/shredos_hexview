@@ -30,7 +30,7 @@ make
 What the Shannon score means:
 
 - 0.0000: Plain zeros (0x00) or unformatted empty space.
-- 1.0 to 6.9: Structured files, file systems, operating system code, or compressed data (which matches your 6.2788 score—typical of an active partition containing standard files, filesystem tables, or application binaries).
+- 1.0 to 6.9: Structured files, file systems, operating system code, or compressed data (e.g 6.2788 score—typical of an active partition containing standard files, filesystem tables, or application binaries).
 - 7.0 to 7.8: High randomness or encrypted partitions.
 - 7.9 to 8.0: Maximum random noise (what you'd see after a cryptographically secure erase pass or NIST SP 800-88 compliant random overwrite).
 
