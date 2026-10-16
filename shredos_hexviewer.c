@@ -10,31 +10,61 @@
 #include <ncurses.h>
 #include <time.h>
 #include <sys/types.h>
+#include <ctype.h>
+#include <math.h>
 
 #define MAX_PATH 512
 
 #define CP_BORDER 1
 #define CP_TITLE  2
 
+typedef enum {
+    SEARCH_NON_ZERO = 1,
+    SEARCH_NON_FF,
+    SEARCH_HEX_PATTERN,
+    SEARCH_ASCII_PATTERN,
+    SEARCH_ASCII_PATTERN_CI
+} search_type_t;
+
+typedef struct {
+    unsigned char value;
+    int is_wildcard; // 1 if wildcard (??), 0 if fixed value
+} search_pattern_element_t;
+
 typedef struct {
     char name[64];
     char path[MAX_PATH];
     char model_serial[128];
+    char signature[32];
     int fd;
     off_t size;
     off_t offset;
+    // Persistent search state for "Find Next" (n = next)
+    int last_search_valid;
+    search_type_t last_search_type;
+    search_pattern_element_t last_hex_pat[64];
+    unsigned char last_ascii_pat[64];
+    int last_pat_len;
+    off_t last_found_offset;
+    unsigned long long last_target_bytes;
+    int last_is_full_scan;
 } drive_info_t;
 
 // Function declarations
 void init_ncurses_ui(void);
 void get_model_and_serial(const char *dev_name, char *dest, size_t max_len);
+void detect_drive_signature(drive_info_t *drive);
 int get_drive_list(drive_info_t drives[], int max_drives);
 void close_drives(drive_info_t drives[], int count);
 void render_hex_view(WINDOW *win, drive_info_t *drive);
 int get_dynamic_bytes_per_row(WINDOW *win);
 off_t handle_goto_popup(drive_info_t *drive, int bytes_per_row);
 off_t handle_random_search(drive_info_t *drive, int bytes_per_row);
+off_t execute_search(drive_info_t *drive, int bytes_per_row, search_type_t search_type, search_pattern_element_t *hex_pattern, unsigned char *ascii_pattern, int pat_len, unsigned long long target_bytes, int is_full_scan, off_t start_offset, int is_find_next);
+void handle_entropy_check(drive_info_t *drive, int bytes_per_row);
 void show_message_popup(const char *title, const char *msg);
+int parse_hex_pattern(const char *str, search_pattern_element_t *pattern, int max_len);
+int parse_ascii_pattern(const char *str, unsigned char *buf, int max_len, int case_insensitive);
 
 int main(int argc, char *argv[]) {
     (void)argc;
@@ -210,7 +240,7 @@ int main(int argc, char *argv[]) {
 
         // --- Render Frameless Help Bar on Bottom Line ---
         wclear(win_help);
-        mvwprintw(win_help, 0, 0, "   r=Reload Devices | g=goto | s=search | PgUp/PgDn=Scroll Hex View | <=Start | >=End | q=Quit");
+        mvwprintw(win_help, 0, 0, "   r=Reload | g=goto | s=search | e=entropy | PgUp/PgDn=Scroll | <=Start | >=End | q=Quit");
         wrefresh(win_help);
 
         // --- Handle Input (Timed 250ms Poll) ---
@@ -312,6 +342,13 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
+            case 'e':
+            case 'E':
+                if (drive_count > 0) {
+                    handle_entropy_check(&drives[selected_drive], dynamic_bpr);
+                }
+                break;
+
             case 'r':
             case 'R':
                 break;
@@ -402,6 +439,62 @@ void get_model_and_serial(const char *dev_name, char *dest, size_t max_len) {
     snprintf(dest, max_len, "%s / %s", model, serial);
 }
 
+void detect_drive_signature(drive_info_t *drive) {
+    if (drive->fd < 0) {
+        snprintf(drive->signature, sizeof(drive->signature), "Unknown");
+        return;
+    }
+
+    unsigned char sector_buf[4096];
+    memset(sector_buf, 0, sizeof(sector_buf));
+
+    lseek(drive->fd, 0, SEEK_SET);
+    ssize_t n = read(drive->fd, sector_buf, sizeof(sector_buf));
+    if (n < 512) {
+        snprintf(drive->signature, sizeof(drive->signature), "Raw");
+        return;
+    }
+
+    // 1. Check GPT signature ("EFI PART" at LBA 1 / offset 512)
+    if (n >= 1024 && memcmp(sector_buf + 512, "EFI PART", 8) == 0) {
+        snprintf(drive->signature, sizeof(drive->signature), "GPT");
+        return;
+    }
+
+    // 2. Check MBR boot signature (0x55AA at offset 510-511)
+    int has_mbr = (sector_buf[510] == 0x55 && sector_buf[511] == 0xAA);
+
+    // 3. Check Filesystem signatures
+    if (memcmp(sector_buf + 3, "NTFS    ", 8) == 0) {
+        snprintf(drive->signature, sizeof(drive->signature), has_mbr ? "MBR + NTFS" : "NTFS");
+        return;
+    }
+    if (n >= 1082 && sector_buf[1080] == 0x53 && sector_buf[1081] == 0xEF) {
+        snprintf(drive->signature, sizeof(drive->signature), has_mbr ? "MBR + ext2/3/4" : "ext2/3/4");
+        return;
+    }
+    if (memcmp(sector_buf + 0x52, "FAT32   ", 8) == 0 || memcmp(sector_buf + 0x26, "FAT", 3) == 0) {
+        snprintf(drive->signature, sizeof(drive->signature), has_mbr ? "MBR + FAT" : "FAT");
+        return;
+    }
+
+    // 4. Check ISO9660 (CD001 signature at offset 32768) using a targeted read
+    unsigned char iso_buf[5];
+    if (lseek(drive->fd, 32768, SEEK_SET) == 32768 && read(drive->fd, iso_buf, 5) == 5) {
+        if (memcmp(iso_buf, "CD001", 5) == 0) {
+            snprintf(drive->signature, sizeof(drive->signature), "ISO9660");
+            return;
+        }
+    }
+
+    if (has_mbr) {
+        snprintf(drive->signature, sizeof(drive->signature), "MBR");
+        return;
+    }
+
+    snprintf(drive->signature, sizeof(drive->signature), "Raw / Unknown");
+}
+
 int get_drive_list(drive_info_t drives[], int max_drives) {
     DIR *dir = opendir("/sys/block");
     if (!dir) return 0;
@@ -439,14 +532,18 @@ int get_drive_list(drive_info_t drives[], int max_drives) {
         drives[count].path[path_len] = '\0';
 
         drives[count].offset = 0;
+        drives[count].fd = fd;
+        drives[count].last_search_valid = 0;
 
         // Fetch Model / Serial string
         get_model_and_serial(entry->d_name, drives[count].model_serial, sizeof(drives[count].model_serial));
 
+        // Auto-detect Partition Table / Filesystem signature
+        detect_drive_signature(&drives[count]);
+
         if (ioctl(fd, BLKGETSIZE64, &drives[count].size) < 0) {
             drives[count].size = lseek(fd, 0, SEEK_END);
         }
-        drives[count].fd = fd;
         count++;
     }
     closedir(dir);
@@ -468,8 +565,8 @@ int get_dynamic_bytes_per_row(WINDOW *win) {
 }
 
 void show_message_popup(const char *title, const char *msg) {
-    int h = 8;
-    int w = 64;
+    int h = 9;
+    int w = 66;
     int y = (LINES - h) / 2;
     int x = (COLS - w) / 2;
     WINDOW *win = newwin(h, w, y, x);
@@ -478,8 +575,24 @@ void show_message_popup(const char *title, const char *msg) {
     mvwprintw(win, 0, 2, " %s ", title);
     wattroff(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
 
-    mvwprintw(win, 2, 3, "%s", msg);
-    mvwprintw(win, 5, (w - 27) / 2, "Press any key to continue");
+    // Parse newlines and ensure every line starts at column 3 (safely inside the border)
+    char line_buf[256];
+    int r = 2;
+    const char *p = msg;
+    while (*p && r < h - 3) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len >= sizeof(line_buf)) len = sizeof(line_buf) - 1;
+        memcpy(line_buf, p, len);
+        line_buf[len] = '\0';
+
+        mvwprintw(win, r, 3, "%s", line_buf);
+        r++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+
+    mvwprintw(win, h - 2, (w - 27) / 2, "Press any key to continue");
     wrefresh(win);
     wgetch(win);
     delwin(win);
@@ -571,21 +684,149 @@ off_t handle_goto_popup(drive_info_t *drive, int bytes_per_row) {
     return new_offset;
 }
 
+int parse_hex_pattern(const char *str, search_pattern_element_t *pattern, int max_len) {
+    int len = 0;
+    const char *p = str;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    while (*p && len < max_len) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+
+        // Check for wildcard "??" pattern element
+        if (p[0] == '?' && p[1] == '?') {
+            pattern[len].value = 0x00;
+            pattern[len].is_wildcard = 1;
+            len++;
+            p += 2;
+            continue;
+        }
+
+        char hex_byte[3] = {0};
+        if (p[0] && p[1] && isxdigit(p[0]) && isxdigit(p[1])) {
+            hex_byte[0] = p[0];
+            hex_byte[1] = p[1];
+            pattern[len].value = (unsigned char)strtol(hex_byte, NULL, 16);
+            pattern[len].is_wildcard = 0;
+            len++;
+            p += 2;
+        } else {
+            break;
+        }
+    }
+    return len;
+}
+
+int parse_ascii_pattern(const char *str, unsigned char *buf, int max_len, int case_insensitive) {
+    size_t len = strlen(str);
+    if ((int)len > max_len) len = max_len;
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = case_insensitive ? (unsigned char)tolower((unsigned char)str[i]) : (unsigned char)str[i];
+    }
+    return (int)len;
+}
+
 off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
+    // --- Step 1: Category Selection Popup ---
+    int m_height = 13;
+    int m_width = 56;
+    int starty = (LINES - m_height) / 2;
+    int startx = (COLS - m_width) / 2;
+
+    WINDOW *menu_win = newwin(m_height, m_width, starty, startx);
+    keypad(menu_win, TRUE);
+
+    box(menu_win, 0, 0);
+    wattron(menu_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+    mvwprintw(menu_win, 0, 2, " Search Category ");
+    wattroff(menu_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+    mvwprintw(menu_win, 2, 3, "Select Search Type:");
+    mvwprintw(menu_win, 4, 5, "[1] Non-Zero Search (!= 0x00)");
+    mvwprintw(menu_win, 5, 5, "[2] Non-0xFF Search (!= 0xFF)");
+    mvwprintw(menu_win, 6, 5, "[3] Hex Pattern Search (Supports ??\x29)");
+    mvwprintw(menu_win, 7, 5, "[4] ASCII Pattern Search (case sensitive)");
+    mvwprintw(menu_win, 8, 5, "[5] ASCII Pattern Search (case insensitive)");
+    mvwprintw(menu_win, 10, 3, "Press 1-5, or Esc to cancel");
+    wrefresh(menu_win);
+
+    int c_ch = wgetch(menu_win);
+    delwin(menu_win);
+    touchwin(stdscr);
+
+    if (c_ch < '1' || c_ch > '5') {
+        return drive->offset;
+    }
+
+    search_type_t search_type = (search_type_t)(c_ch - '0');
+    search_pattern_element_t hex_pattern[64] = { {0, 0} };
+    unsigned char ascii_pattern[64] = {0};
+    int pat_len = 0;
+
+    // --- Step 2: Pattern Input Popup (if Hex or ASCII selected) ---
+    if (search_type == SEARCH_HEX_PATTERN || search_type == SEARCH_ASCII_PATTERN || search_type == SEARCH_ASCII_PATTERN_CI) {
+        int p_height = 8;
+        int p_width = 62;
+        starty = (LINES - p_height) / 2;
+        startx = (COLS - p_width) / 2;
+
+        WINDOW *pat_win = newwin(p_height, p_width, starty, startx);
+        box(pat_win, 0, 0);
+        wattron(pat_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        if (search_type == SEARCH_HEX_PATTERN) {
+            mvwprintw(pat_win, 0, 2, " Hex Pattern Search (?? Wildcard) ");
+            mvwprintw(pat_win, 2, 3, "Enter hex bytes/wildcards (e.g. 4D 5A ?? 00):");
+        } else if (search_type == SEARCH_ASCII_PATTERN_CI) {
+            mvwprintw(pat_win, 0, 2, " ASCII Search (Case Insensitive) ");
+            mvwprintw(pat_win, 2, 3, "Enter ASCII search string:");
+        } else {
+            mvwprintw(pat_win, 0, 2, " ASCII Pattern Search (Case Sensitive) ");
+            mvwprintw(pat_win, 2, 3, "Enter ASCII search string:");
+        }
+        wattroff(pat_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+        mvwprintw(pat_win, 5, 3, "Pattern: ");
+        wrefresh(pat_win);
+
+        char pat_buf[64] = {0};
+        echo();
+        curs_set(1);
+        wgetnstr(pat_win, pat_buf, 63);
+        noecho();
+        curs_set(0);
+        delwin(pat_win);
+        touchwin(stdscr);
+
+        if (search_type == SEARCH_HEX_PATTERN) {
+            pat_len = parse_hex_pattern(pat_buf, hex_pattern, 64);
+        } else if (search_type == SEARCH_ASCII_PATTERN_CI) {
+            pat_len = parse_ascii_pattern(pat_buf, ascii_pattern, sizeof(ascii_pattern), 1);
+        } else {
+            pat_len = parse_ascii_pattern(pat_buf, ascii_pattern, sizeof(ascii_pattern), 0);
+        }
+
+        if (pat_len <= 0) {
+            show_message_popup("Error", "Invalid or empty search pattern entered.");
+            return drive->offset;
+        }
+    }
+
+    // --- Step 3: Scope Input Popup ---
     int p_height = 10;
     int p_width = 66;
-    int starty = (LINES - p_height) / 2;
-    int startx = (COLS - p_width) / 2;
+    starty = (LINES - p_height) / 2;
+    startx = (COLS - p_width) / 2;
 
     WINDOW *pop = newwin(p_height, p_width, starty, startx);
     keypad(pop, TRUE);
 
     box(pop, 0, 0);
     wattron(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
-    mvwprintw(pop, 0, 2, " Search Non-Zero ");
+    mvwprintw(pop, 0, 2, " Search Scope ");
     wattroff(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
 
-    mvwprintw(pop, 2, 3, "Enter scope (e.g. 1%%, 95%%, 8GB, 64GB, 100%%):");
+    mvwprintw(pop, 2, 3, "Enter scope (e.g. 1%%, 95%%, 8GB, 1TB, 100%%):");
     mvwprintw(pop, 3, 3, "(100%% = Full Sequential Scan; <100%% = 1000-Chunk Scatter Scan)");
     mvwprintw(pop, 6, 3, "Scope: ");
     wrefresh(pop);
@@ -617,10 +858,13 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
         input_buf[--len] = '\0';
         if (len > 0) {
             char prev_char = input_buf[len - 1];
-            if (prev_char == 'G' || prev_char == 'g') { unit = 'G'; input_buf[--len] = '\0'; }
+            if (prev_char == 'T' || prev_char == 't') { unit = 'T'; input_buf[--len] = '\0'; }
+            else if (prev_char == 'G' || prev_char == 'g') { unit = 'G'; input_buf[--len] = '\0'; }
             else if (prev_char == 'M' || prev_char == 'm') { unit = 'M'; input_buf[--len] = '\0'; }
             else if (prev_char == 'K' || prev_char == 'k') { unit = 'K'; input_buf[--len] = '\0'; }
         }
+    } else if (last_char == 'T' || last_char == 't') {
+        unit = 'T'; input_buf[--len] = '\0';
     } else if (last_char == 'G' || last_char == 'g') {
         unit = 'G'; input_buf[--len] = '\0';
     } else if (last_char == 'M' || last_char == 'm') {
@@ -632,10 +876,16 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
     double numeric_val = atof(input_buf);
     unsigned long long target_bytes = 0;
 
+    if (unit == '\0' && numeric_val <= 100.0) {
+        unit = '%';
+    }
+
     if (unit == '%') {
         if (numeric_val < 0) numeric_val = 0;
         if (numeric_val > 100) numeric_val = 100;
         target_bytes = (unsigned long long)((double)drive->size * (numeric_val / 100.0));
+    } else if (unit == 'T') {
+        target_bytes = (unsigned long long)(numeric_val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
     } else if (unit == 'G') {
         target_bytes = (unsigned long long)(numeric_val * 1024.0 * 1024.0 * 1024.0);
     } else if (unit == 'M') {
@@ -647,45 +897,71 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
     }
 
     if (target_bytes == 0) target_bytes = (unsigned long long)bytes_per_row * 100;
-
     if (target_bytes > (unsigned long long)drive->size) {
         target_bytes = (unsigned long long)drive->size;
     }
 
+    int is_full_scan = (unit == '%' && numeric_val >= 99.99) || (target_bytes >= (unsigned long long)drive->size);
+
+    return execute_search(drive, bytes_per_row, search_type, hex_pattern, ascii_pattern, pat_len, target_bytes, is_full_scan, 0, 0);
+}
+
+off_t execute_search(drive_info_t *drive, int bytes_per_row, search_type_t search_type, search_pattern_element_t *hex_pattern, unsigned char *ascii_pattern, int pat_len, unsigned long long target_bytes, int is_full_scan, off_t start_offset, int is_find_next) {
     double target_mb = (double)target_bytes / (1024.0 * 1024.0);
     if (target_mb < 0.1) target_mb = 0.1;
 
-    int is_full_scan = (unit == '%' && numeric_val >= 99.99) || (target_bytes >= (unsigned long long)drive->size);
-
     size_t sector_size = 512;
     int found = 0;
-    off_t found_offset = drive->offset;
+    int cancelled = 0;
+    off_t found_offset = start_offset;
     unsigned char *sector_buf = malloc(sector_size);
     if (!sector_buf) {
         show_message_popup("Error", "Memory allocation failed for search buffer.");
         return drive->offset;
     }
 
-    int prog_h = 7;
+    int prog_h = 8;
     int prog_w = 64;
     int prog_y = (LINES - prog_h) / 2;
     int prog_x = (COLS - prog_w) / 2;
     WINDOW *prog_win = newwin(prog_h, prog_w, prog_y, prog_x);
+    keypad(prog_win, TRUE);
+    wtimeout(prog_win, 0);
+
     box(prog_win, 0, 0);
     wattron(prog_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
     mvwprintw(prog_win, 0, 2, is_full_scan ? " Full Sequential Search " : " 1000-Chunk Scatter Search ");
     wattroff(prog_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
     mvwprintw(prog_win, 2, 3, "Progress:   0%% complete");
     mvwprintw(prog_win, 3, 3, "Checked:    0.0MB / %.1fMB", target_mb);
+    mvwprintw(prog_win, 5, 3, "Press ESC to cancel search");
     wrefresh(prog_win);
+
+    struct timespec last_check;
+    clock_gettime(CLOCK_MONOTONIC, &last_check);
 
     if (is_full_scan) {
         // --- 100% FULL EXHAUSTIVE SEQUENTIAL SCAN ---
         unsigned long long total_sectors = (target_bytes + sector_size - 1) / sector_size;
         if (total_sectors == 0) total_sectors = 1;
 
+        unsigned char history[64] = {0};
+        int history_len = 0;
         unsigned long long total_bytes_read = 0;
-        for (unsigned long long i = 0; i < total_sectors && !found; i++) {
+
+        for (unsigned long long i = 0; i < total_sectors && !found && !cancelled; i++) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - last_check.tv_sec) * 1000 + (now.tv_nsec - last_check.tv_nsec) / 1000000;
+            if (elapsed_ms >= 250) {
+                last_check = now;
+                int ch = wgetch(prog_win);
+                if (ch == 27 || ch == 'q' || ch == 'Q') {
+                    cancelled = 1;
+                    break;
+                }
+            }
+
             off_t check_offset = (off_t)(i * sector_size);
             if (check_offset >= drive->size) break;
 
@@ -699,12 +975,79 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
             ssize_t n = read(drive->fd, sector_buf, to_read);
             if (n <= 0) break;
 
-            int non_zero = 0;
-            for (ssize_t b = 0; b < n; b++) {
-                if (sector_buf[b] != 0) {
-                    non_zero = 1;
-                    found_offset = check_offset + b;
+            unsigned char search_buf[512 + 64];
+            memcpy(search_buf, history, history_len);
+            memcpy(search_buf + history_len, sector_buf, n);
+            int total_len = history_len + (int)n;
+
+            // FIX: Start idx at 0 to include cross-boundary history overlap bytes
+            for (int idx = 0; idx < total_len; idx++) {
+                off_t current_byte_offset = check_offset - history_len + idx;
+                if (current_byte_offset < 0) continue;
+                if (current_byte_offset >= drive->size) break;
+
+                // Ensure we don't re-trigger the exact same match on Find Next
+                if (is_find_next && current_byte_offset <= drive->last_found_offset) {
+                    continue;
+                }
+
+                unsigned char b = search_buf[idx];
+                int matched = 0;
+
+                if (search_type == SEARCH_NON_ZERO) {
+                    if (b != 0x00) { matched = 1; found_offset = current_byte_offset; }
+                } else if (search_type == SEARCH_NON_FF) {
+                    if (b != 0xFF) { matched = 1; found_offset = current_byte_offset; }
+                } else if (search_type == SEARCH_HEX_PATTERN) {
+                    if (idx + pat_len <= total_len) {
+                        int p_match = 1;
+                        for (int p = 0; p < pat_len; p++) {
+                            if (!hex_pattern[p].is_wildcard) {
+                                if (search_buf[idx + p] != hex_pattern[p].value) {
+                                    p_match = 0;
+                                    break;
+                                }
+                            }
+                        }
+                        if (p_match) {
+                            matched = 1;
+                            found_offset = current_byte_offset;
+                        }
+                    }
+                } else if (search_type == SEARCH_ASCII_PATTERN || search_type == SEARCH_ASCII_PATTERN_CI) {
+                    if (idx + pat_len <= total_len) {
+                        int p_match = 1;
+                        for (int p = 0; p < pat_len; p++) {
+                            unsigned char disk_b = search_buf[idx + p];
+                            if (search_type == SEARCH_ASCII_PATTERN_CI) {
+                                disk_b = (unsigned char)tolower(disk_b);
+                            }
+                            if (disk_b != ascii_pattern[p]) {
+                                p_match = 0;
+                                break;
+                            }
+                        }
+                        if (p_match) {
+                            matched = 1;
+                            found_offset = current_byte_offset;
+                        }
+                    }
+                }
+
+                if (matched) {
+                    found = 1;
                     break;
+                }
+            }
+
+            if (search_type == SEARCH_HEX_PATTERN || search_type == SEARCH_ASCII_PATTERN || search_type == SEARCH_ASCII_PATTERN_CI) {
+                int keep = pat_len - 1;
+                if (keep > n) keep = n;
+                if (keep > 0) {
+                    memcpy(history, sector_buf + n - keep, keep);
+                    history_len = keep;
+                } else {
+                    history_len = 0;
                 }
             }
 
@@ -716,16 +1059,11 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
             mvwprintw(prog_win, 2, 13, "%3d%% complete", percent);
             mvwprintw(prog_win, 3, 13, "%.1fMB / %.1fMB", checked_mb, target_mb);
             wrefresh(prog_win);
-
-            if (non_zero) {
-                found = 1;
-                break;
-            }
         }
     } else {
-        // --- 1,000-CHUNK RANDOMIZED SCATTER SEARCH (Zero-Gap Sector Tiling) ---
+        // --- 1,000-CHUNK RANDOMIZED SCATTER SCAN ---
         int num_chunks = 1000;
-        unsigned long long total_sectors = (drive->size + sector_size - 1) / sector_size;
+        unsigned long long total_sectors = (target_bytes + sector_size - 1) / sector_size;
         if (total_sectors < (unsigned long long)num_chunks) {
             num_chunks = (int)total_sectors;
             if (num_chunks < 1) num_chunks = 1;
@@ -773,13 +1111,28 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
 
         unsigned long long total_bytes_read = 0;
 
-        for (int idx = 0; idx < num_chunks && !found; idx++) {
+        for (int idx = 0; idx < num_chunks && !found && !cancelled; idx++) {
             int c_idx = indices[idx];
             unsigned long long start_sec = chunks[c_idx].start_sec;
             unsigned long long end_sec = chunks[c_idx].end_sec;
 
-            for (unsigned long long sec = start_sec; sec < end_sec && !found; sec++) {
+            unsigned char history[64] = {0};
+            int history_len = 0;
+
+            for (unsigned long long sec = start_sec; sec < end_sec && !found && !cancelled; sec++) {
                 if (total_bytes_read >= target_bytes) break;
+
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long elapsed_ms = (now.tv_sec - last_check.tv_sec) * 1000 + (now.tv_nsec - last_check.tv_nsec) / 1000000;
+                if (elapsed_ms >= 250) {
+                    last_check = now;
+                    int ch = wgetch(prog_win);
+                    if (ch == 27 || ch == 'q' || ch == 'Q') {
+                        cancelled = 1;
+                        break;
+                    }
+                }
 
                 off_t check_offset = (off_t)(sec * sector_size);
                 if (check_offset >= drive->size) break;
@@ -794,12 +1147,78 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
                 ssize_t n = read(drive->fd, sector_buf, to_read);
                 if (n <= 0) break;
 
-                int non_zero = 0;
-                for (ssize_t b = 0; b < n; b++) {
-                    if (sector_buf[b] != 0) {
-                        non_zero = 1;
-                        found_offset = check_offset + b;
+                unsigned char search_buf[512 + 64];
+                memcpy(search_buf, history, history_len);
+                memcpy(search_buf + history_len, sector_buf, n);
+                int total_len = history_len + (int)n;
+
+                // FIX: Start idx at 0 for scatter scan chunks as well
+                for (int s_idx = 0; s_idx < total_len; s_idx++) {
+                    off_t current_byte_offset = check_offset - history_len + s_idx;
+                    if (current_byte_offset < 0) continue;
+                    if (current_byte_offset >= drive->size) break;
+
+                    if (is_find_next && current_byte_offset <= drive->last_found_offset) {
+                        continue;
+                    }
+
+                    unsigned char b = search_buf[s_idx];
+                    int matched = 0;
+
+                    if (search_type == SEARCH_NON_ZERO) {
+                        if (b != 0x00) { matched = 1; found_offset = current_byte_offset; }
+                    } else if (search_type == SEARCH_NON_FF) {
+                        if (b != 0xFF) { matched = 1; found_offset = current_byte_offset; }
+                    } else if (search_type == SEARCH_HEX_PATTERN) {
+                        if (s_idx + pat_len <= total_len) {
+                            int p_match = 1;
+                            for (int p = 0; p < pat_len; p++) {
+                                if (!hex_pattern[p].is_wildcard) {
+                                    if (search_buf[s_idx + p] != hex_pattern[p].value) {
+                                        p_match = 0;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (p_match) {
+                                matched = 1;
+                                found_offset = current_byte_offset;
+                            }
+                        }
+                    } else if (search_type == SEARCH_ASCII_PATTERN || search_type == SEARCH_ASCII_PATTERN_CI) {
+                        if (s_idx + pat_len <= total_len) {
+                            int p_match = 1;
+                            for (int p = 0; p < pat_len; p++) {
+                                unsigned char disk_b = search_buf[s_idx + p];
+                                if (search_type == SEARCH_ASCII_PATTERN_CI) {
+                                    disk_b = (unsigned char)tolower(disk_b);
+                                }
+                                if (disk_b != ascii_pattern[p]) {
+                                    p_match = 0;
+                                    break;
+                                }
+                            }
+                            if (p_match) {
+                                matched = 1;
+                                found_offset = current_byte_offset;
+                            }
+                        }
+                    }
+
+                    if (matched) {
+                        found = 1;
                         break;
+                    }
+                }
+
+                if (search_type == SEARCH_HEX_PATTERN || search_type == SEARCH_ASCII_PATTERN || search_type == SEARCH_ASCII_PATTERN_CI) {
+                    int keep = pat_len - 1;
+                    if (keep > n) keep = n;
+                    if (keep > 0) {
+                        memcpy(history, sector_buf + n - keep, keep);
+                        history_len = keep;
+                    } else {
+                        history_len = 0;
                     }
                 }
 
@@ -811,12 +1230,8 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
                 mvwprintw(prog_win, 2, 13, "%3d%% complete", percent);
                 mvwprintw(prog_win, 3, 13, "%.1fMB / %.1fMB", checked_mb, target_mb);
                 wrefresh(prog_win);
-
-                if (non_zero) {
-                    found = 1;
-                    break;
-                }
             }
+
             if (total_bytes_read >= target_bytes) break;
         }
 
@@ -828,15 +1243,372 @@ off_t handle_random_search(drive_info_t *drive, int bytes_per_row) {
     delwin(prog_win);
     touchwin(stdscr);
 
-    if (found) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Non-zero data found at offset 0x%012lX!", found_offset);
-        show_message_popup("Search Success", msg);
-        return (found_offset / bytes_per_row) * bytes_per_row;
-    } else {
-        show_message_popup("Search Result", "No non-zero data found in searched scope.");
+    if (cancelled) {
+        show_message_popup("Cancelled", "Search cancelled by user.");
         return drive->offset;
     }
+
+    if (found) {
+        // Save search state for "Find Next" (n = next)
+        drive->last_search_valid = 1;
+        drive->last_search_type = search_type;
+        drive->last_pat_len = pat_len;
+        drive->last_found_offset = found_offset;
+        drive->last_target_bytes = target_bytes;
+        drive->last_is_full_scan = is_full_scan;
+        for (int i = 0; i < pat_len; i++) {
+            drive->last_hex_pat[i] = hex_pattern[i];
+            drive->last_ascii_pat[i] = ascii_pattern[i];
+        }
+
+        // --- Success Popup with "Press n for next (n = next)" ---
+        int h = 10;
+        int w = 70;
+        int y = (LINES - h) / 2;
+        int x = (COLS - w) / 2;
+        WINDOW *succ_win = newwin(h, w, y, x);
+        keypad(succ_win, TRUE);
+        box(succ_win, 0, 0);
+        wattron(succ_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        mvwprintw(succ_win, 0, 2, " Search Success ");
+        wattroff(succ_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+        mvwprintw(succ_win, 2, 3, "Pattern found at offset 0x%012lX!", (unsigned long)found_offset);
+        mvwprintw(succ_win, 4, 3, "Press 'n' for next (n = next) to continue search.");
+        mvwprintw(succ_win, 5, 3, "Press any other key to view offset.");
+        wrefresh(succ_win);
+
+        int key = wgetch(succ_win);
+        delwin(succ_win);
+        touchwin(stdscr);
+
+        if (key == 'n' || key == 'N') {
+            return execute_search(drive, bytes_per_row, search_type, hex_pattern, ascii_pattern, pat_len, target_bytes, is_full_scan, found_offset + 1, 1);
+        }
+
+        return (found_offset / bytes_per_row) * bytes_per_row;
+    } else {
+        show_message_popup("Search Result", "No matching pattern found in searched scope.");
+        return drive->offset;
+    }
+}
+
+void handle_entropy_check(drive_info_t *drive, int bytes_per_row) {
+    (void)bytes_per_row;
+    // --- Step 1: Scope Input Popup ---
+    int p_height = 10;
+    int p_width = 66;
+    int starty = (LINES - p_height) / 2;
+    int startx = (COLS - p_width) / 2;
+
+    WINDOW *pop = newwin(p_height, p_width, starty, startx);
+    keypad(pop, TRUE);
+
+    box(pop, 0, 0);
+    wattron(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+    mvwprintw(pop, 0, 2, " Block Entropy Calculation (Shannon) ");
+    wattroff(pop, COLOR_PAIR(CP_TITLE) | A_BOLD);
+
+    mvwprintw(pop, 2, 3, "Enter scope (e.g. 1%%, 95%%, 8GB, 1TB, 100%%):");
+    mvwprintw(pop, 3, 3, "(100%% = Full Sequential Scan; <100%% = 1000-Chunk Scatter Scan)");
+    mvwprintw(pop, 6, 3, "Scope: ");
+    wrefresh(pop);
+
+    char input_buf[64] = {0};
+    echo();
+    curs_set(1);
+    wgetnstr(pop, input_buf, 63);
+    noecho();
+    curs_set(0);
+    delwin(pop);
+    touchwin(stdscr);
+
+    size_t len = strlen(input_buf);
+    if (len == 0) return;
+
+    while (len > 0 && (input_buf[len - 1] == ' ' || input_buf[len - 1] == '\r' || input_buf[len - 1] == '\n')) {
+        input_buf[--len] = '\0';
+    }
+    if (len == 0) return;
+
+    char unit = '\0';
+    char last_char = input_buf[len - 1];
+
+    if (last_char == '%') {
+        unit = '%';
+        input_buf[--len] = '\0';
+    } else if (last_char == 'B' || last_char == 'b') {
+        input_buf[--len] = '\0';
+        if (len > 0) {
+            char prev_char = input_buf[len - 1];
+            if (prev_char == 'T' || prev_char == 't') { unit = 'T'; input_buf[--len] = '\0'; }
+            else if (prev_char == 'G' || prev_char == 'g') { unit = 'G'; input_buf[--len] = '\0'; }
+            else if (prev_char == 'M' || prev_char == 'm') { unit = 'M'; input_buf[--len] = '\0'; }
+            else if (prev_char == 'K' || prev_char == 'k') { unit = 'K'; input_buf[--len] = '\0'; }
+        }
+    } else if (last_char == 'T' || last_char == 't') {
+        unit = 'T'; input_buf[--len] = '\0';
+    } else if (last_char == 'G' || last_char == 'g') {
+        unit = 'G'; input_buf[--len] = '\0';
+    } else if (last_char == 'M' || last_char == 'm') {
+        unit = 'M'; input_buf[--len] = '\0';
+    } else if (last_char == 'K' || last_char == 'k') {
+        unit = 'K'; input_buf[--len] = '\0';
+    }
+
+    double numeric_val = atof(input_buf);
+    unsigned long long target_bytes = 0;
+
+    if (unit == '\0' && numeric_val <= 100.0) {
+        unit = '%';
+    }
+
+    if (unit == '%') {
+        if (numeric_val < 0) numeric_val = 0;
+        if (numeric_val > 100) numeric_val = 100;
+        target_bytes = (unsigned long long)((double)drive->size * (numeric_val / 100.0));
+    } else if (unit == 'T') {
+        target_bytes = (unsigned long long)(numeric_val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+    } else if (unit == 'G') {
+        target_bytes = (unsigned long long)(numeric_val * 1024.0 * 1024.0 * 1024.0);
+    } else if (unit == 'M') {
+        target_bytes = (unsigned long long)(numeric_val * 1024.0 * 1024.0);
+    } else if (unit == 'K') {
+        target_bytes = (unsigned long long)(numeric_val * 1024.0);
+    } else {
+        target_bytes = (unsigned long long)numeric_val;
+    }
+
+    if (target_bytes == 0) target_bytes = 4096 * 100;
+    if (target_bytes > (unsigned long long)drive->size) {
+        target_bytes = (unsigned long long)drive->size;
+    }
+
+    double target_mb = (double)target_bytes / (1024.0 * 1024.0);
+    if (target_mb < 0.1) target_mb = 0.1;
+
+    int is_full_scan = (unit == '%' && numeric_val >= 99.99) || (target_bytes >= (unsigned long long)drive->size);
+
+    size_t sector_size = 4096; // 4KB blocks for efficient entropy reading
+    int cancelled = 0;
+    unsigned char *sector_buf = malloc(sector_size);
+    if (!sector_buf) {
+        show_message_popup("Error", "Memory allocation failed for entropy buffer.");
+        return;
+    }
+
+    int prog_h = 8;
+    int prog_w = 64;
+    int prog_y = (LINES - prog_h) / 2;
+    int prog_x = (COLS - prog_w) / 2;
+    WINDOW *prog_win = newwin(prog_h, prog_w, prog_y, prog_x);
+    keypad(prog_win, TRUE);
+    wtimeout(prog_win, 0);
+
+    box(prog_win, 0, 0);
+    wattron(prog_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+    mvwprintw(prog_win, 0, 2, is_full_scan ? " Full Entropy Scan " : " 1000-Chunk Scatter Entropy Scan ");
+    wattroff(prog_win, COLOR_PAIR(CP_TITLE) | A_BOLD);
+    mvwprintw(prog_win, 2, 3, "Progress:   0%% complete");
+    mvwprintw(prog_win, 3, 3, "Checked:    0.0MB / %.1fMB", target_mb);
+    mvwprintw(prog_win, 5, 3, "Press ESC to cancel entropy check");
+    wrefresh(prog_win);
+
+    struct timespec last_check;
+    clock_gettime(CLOCK_MONOTONIC, &last_check);
+
+    unsigned long long byte_counts[256] = {0};
+    unsigned long long total_sampled_bytes = 0;
+
+    if (is_full_scan) {
+        // --- 100% FULL EXHAUSTIVE SEQUENTIAL SCAN ---
+        unsigned long long total_sectors = (target_bytes + sector_size - 1) / sector_size;
+        if (total_sectors == 0) total_sectors = 1;
+
+        for (unsigned long long i = 0; i < total_sectors && !cancelled; i++) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - last_check.tv_sec) * 1000 + (now.tv_nsec - last_check.tv_nsec) / 1000000;
+            if (elapsed_ms >= 250) {
+                last_check = now;
+                int ch = wgetch(prog_win);
+                if (ch == 27 || ch == 'q' || ch == 'Q') {
+                    cancelled = 1;
+                    break;
+                }
+            }
+
+            off_t check_offset = (off_t)(i * sector_size);
+            if (check_offset >= drive->size) break;
+
+            size_t to_read = sector_size;
+            if (check_offset + (off_t)to_read > drive->size) {
+                to_read = (size_t)(drive->size - check_offset);
+            }
+            if (to_read == 0) break;
+
+            lseek(drive->fd, check_offset, SEEK_SET);
+            ssize_t n = read(drive->fd, sector_buf, to_read);
+            if (n <= 0) break;
+
+            for (ssize_t b = 0; b < n; b++) {
+                byte_counts[sector_buf[b]]++;
+            }
+            total_sampled_bytes += n;
+
+            int percent = (int)((total_sampled_bytes * 100) / target_bytes);
+            if (percent > 100) percent = 100;
+            double checked_mb = (double)total_sampled_bytes / (1024.0 * 1024.0);
+
+            mvwprintw(prog_win, 2, 13, "%3d%% complete", percent);
+            mvwprintw(prog_win, 3, 13, "%.1fMB / %.1fMB", checked_mb, target_mb);
+            wrefresh(prog_win);
+        }
+    } else {
+        // --- 1,000-CHUNK RANDOMIZED SCATTER SCAN ---
+        int num_chunks = 1000;
+        unsigned long long total_sectors = (drive->size + sector_size - 1) / sector_size;
+        if (total_sectors < (unsigned long long)num_chunks) {
+            num_chunks = (int)total_sectors;
+            if (num_chunks < 1) num_chunks = 1;
+        }
+
+        typedef struct {
+            unsigned long long start_sec;
+            unsigned long long end_sec;
+        } chunk_range_t;
+
+        chunk_range_t *chunks = malloc(num_chunks * sizeof(chunk_range_t));
+        if (!chunks) {
+            free(sector_buf);
+            delwin(prog_win);
+            touchwin(stdscr);
+            show_message_popup("Error", "Memory allocation failed for chunks.");
+            return;
+        }
+
+        for (int i = 0; i < num_chunks; i++) {
+            chunks[i].start_sec = ((unsigned long long)i * total_sectors) / num_chunks;
+            chunks[i].end_sec = ((unsigned long long)(i + 1) * total_sectors) / num_chunks;
+        }
+
+        int *indices = malloc(num_chunks * sizeof(int));
+        if (!indices) {
+            free(chunks);
+            free(sector_buf);
+            delwin(prog_win);
+            touchwin(stdscr);
+            show_message_popup("Error", "Memory allocation failed for chunk indices.");
+            return;
+        }
+        for (int i = 0; i < num_chunks; i++) {
+            indices[i] = i;
+        }
+
+        for (int i = num_chunks - 1; i > 0; i--) {
+            unsigned long long r1 = ((unsigned long long)rand() << 30) ^ rand();
+            int j = (int)(r1 % (i + 1));
+            int temp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = temp;
+        }
+
+        for (int idx = 0; idx < num_chunks && !cancelled; idx++) {
+            int c_idx = indices[idx];
+            unsigned long long start_sec = chunks[c_idx].start_sec;
+            unsigned long long end_sec = chunks[c_idx].end_sec;
+
+            for (unsigned long long sec = start_sec; sec < end_sec && !cancelled; sec++) {
+                if (total_sampled_bytes >= target_bytes) break;
+
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long elapsed_ms = (now.tv_sec - last_check.tv_sec) * 1000 + (now.tv_nsec - last_check.tv_nsec) / 1000000;
+                if (elapsed_ms >= 250) {
+                    last_check = now;
+                    int ch = wgetch(prog_win);
+                    if (ch == 27 || ch == 'q' || ch == 'Q') {
+                        cancelled = 1;
+                        break;
+                    }
+                }
+
+                off_t check_offset = (off_t)(sec * sector_size);
+                if (check_offset >= drive->size) break;
+
+                size_t to_read = sector_size;
+                if (check_offset + (off_t)to_read > drive->size) {
+                    to_read = (size_t)(drive->size - check_offset);
+                }
+                if (to_read == 0) break;
+
+                lseek(drive->fd, check_offset, SEEK_SET);
+                ssize_t n = read(drive->fd, sector_buf, to_read);
+                if (n <= 0) break;
+
+                for (ssize_t b = 0; b < n; b++) {
+                    byte_counts[sector_buf[b]]++;
+                }
+                total_sampled_bytes += n;
+
+                int percent = (int)((total_sampled_bytes * 100) / target_bytes);
+                if (percent > 100) percent = 100;
+                double checked_mb = (double)total_sampled_bytes / (1024.0 * 1024.0);
+
+                mvwprintw(prog_win, 2, 13, "%3d%% complete", percent);
+                mvwprintw(prog_win, 3, 13, "%.1fMB / %.1fMB", checked_mb, target_mb);
+                wrefresh(prog_win);
+            }
+
+            if (total_sampled_bytes >= target_bytes) break;
+        }
+
+        free(indices);
+        free(chunks);
+    }
+
+    free(sector_buf);
+    delwin(prog_win);
+    touchwin(stdscr);
+
+    if (cancelled) {
+        show_message_popup("Cancelled", "Entropy check cancelled by user.");
+        return;
+    }
+
+    // --- Compute Shannon Entropy ---
+    double entropy = 0.0;
+    if (total_sampled_bytes > 0) {
+        for (int i = 0; i < 256; i++) {
+            if (byte_counts[i] > 0) {
+                double p = (double)byte_counts[i] / (double)total_sampled_bytes;
+                entropy -= p * (log(p) / 0.693147180559945319); // log2(p)
+            }
+        }
+    }
+
+    // --- Display Results Popup ---
+    char title_buf[64];
+    char msg_buf[256];
+    snprintf(title_buf, sizeof(title_buf), " Entropy Analysis Result ");
+
+    const char *status_desc = "Unknown";
+    if (entropy < 0.1) {
+        status_desc = "Plain Zeros (0x00) / Empty Space";
+    } else if (entropy < 1.0) {
+        status_desc = "Low Entropy / Repeating Pattern";
+    } else if (entropy < 7.0) {
+        status_desc = "Structured/Compressed Data / Standard Files";
+    } else if (entropy >= 7.9) {
+        status_desc = "Max Random Noise (NIST Wipe Verified!)";
+    } else {
+        status_desc = "High Randomness / Encrypted Data";
+    }
+
+    snprintf(msg_buf, sizeof(msg_buf), "Shannon Entropy: %.4f / 8.0\nSampled Size:    %.1f MB\nStatus:          %s",
+             entropy, (double)total_sampled_bytes / (1024.0 * 1024.0), status_desc);
+
+    show_message_popup(title_buf, msg_buf);
 }
 
 void render_hex_view(WINDOW *win, drive_info_t *drive) {
@@ -864,9 +1636,9 @@ void render_hex_view(WINDOW *win, drive_info_t *drive) {
     box(win, 0, 0);
     wattroff(win, COLOR_PAIR(CP_BORDER));
 
-    // Render pane title
+    // Render pane title with auto-detected signature/partition info
     wattron(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
-    mvwprintw(win, 0, 2, " Hex View: %s, Offset: 0x%012lX ", drive->name, drive->offset);
+    mvwprintw(win, 0, 2, " Hex View: %s [%s], Offset: 0x%012lX ", drive->name, drive->signature, drive->offset);
     wattroff(win, COLOR_PAIR(CP_TITLE) | A_BOLD);
 
     char *hex_buf = malloc(bytes_per_row * 3 + 1);
