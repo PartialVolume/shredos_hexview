@@ -36,7 +36,7 @@ What the Shannon score means:
 
 <img width="1203" height="453" alt="Screenshot_20261016_233342" src="https://github.com/user-attachments/assets/b9572fa4-9a1a-460b-9a70-70a1f8db3f21" />
 
-## Detection of Partition Type
+## Detection of Partition Type - GPT, MBR, raw/unknown.
 <img width="1203" height="453" alt="Screenshot_20261016_233439" src="https://github.com/user-attachments/assets/fd6a4a41-2aba-409c-9481-aad45c59ee55" />
 
 
