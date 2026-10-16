@@ -18,13 +18,19 @@ sudo dnf install ncurses-devel
 make
 ```
 ## Main Screen
-<img width="1143" height="423" alt="Screenshot_20261015_171131" src="https://github.com/user-attachments/assets/166b8a9f-80e6-4084-836b-6360dd4bb042" />
+<img width="1203" height="451" alt="Screenshot_20261016_232446" src="https://github.com/user-attachments/assets/6a0fddf3-9760-4605-9cd5-7403b9a94209" />
 
-## Search for non zero data - full sequential or random chunk with selectable scope, percentage, MB, GB
-<img width="1143" height="423" alt="Screenshot_20261015_171404" src="https://github.com/user-attachments/assets/4f66a85b-daed-4282-b0ec-511db5172c1f" />
+## Multiple Search Methods - full sequential or random chunk with selectable scope, percentage, MB, GB
+<img width="1205" height="452" alt="Screenshot_20261016_232826" src="https://github.com/user-attachments/assets/2b181cf6-18be-4f64-a5ff-cb771c142a0e" />
 
 ## Goto - percentage or offset
-<img width="1143" height="423" alt="Screenshot_20261015_171540" src="https://github.com/user-attachments/assets/82941168-5508-451e-8fc0-32b83c1280bb" />
+<img width="1203" height="453" alt="Screenshot_20261016_233127" src="https://github.com/user-attachments/assets/d4c07b7f-6abc-49c8-af45-2bfcdf813ea4" />
+
+## Shannon entropy Scan 0 to 8 (8 is best for random data)
+<img width="1203" height="453" alt="Screenshot_20261016_233342" src="https://github.com/user-attachments/assets/b9572fa4-9a1a-460b-9a70-70a1f8db3f21" />
+
+## Detection of Partition Type
+<img width="1203" height="453" alt="Screenshot_20261016_233439" src="https://github.com/user-attachments/assets/fd6a4a41-2aba-409c-9481-aad45c59ee55" />
 
 
 
