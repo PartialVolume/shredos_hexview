@@ -1,7 +1,7 @@
 # shredos_hexviewer
 Hex/ascii viewer for ShredOS
 
-## How To Compile
+## Building shredos_hexviewer
 
 #### Debian/Ubuntu
 ```
@@ -28,7 +28,7 @@ make
 ## Main Screen
 <img width="1203" height="451" alt="Screenshot_20261016_232446" src="https://github.com/user-attachments/assets/6a0fddf3-9760-4605-9cd5-7403b9a94209" />
 
-## Multiple Search Methods - full sequential or random chunk with selectable scope, percentage, MB, GB
+## Multiple Search Methods - full sequential or random chunk with selectable scope, percentage, KB, MB, GB, TB
 <img width="1205" height="452" alt="Screenshot_20261016_232826" src="https://github.com/user-attachments/assets/2b181cf6-18be-4f64-a5ff-cb771c142a0e" />
 
 ## Goto - percentage or offset
@@ -45,6 +45,9 @@ What the Shannon score means:
 <img width="1203" height="453" alt="Screenshot_20261016_233342" src="https://github.com/user-attachments/assets/b9572fa4-9a1a-460b-9a70-70a1f8db3f21" />
 
 ## Detection of Partition Type - GPT, MBR, raw/unknown.
+
+Shows whether the signature for a given partition table has been detected.
+
 <img width="1203" height="453" alt="Screenshot_20261016_233439" src="https://github.com/user-attachments/assets/fd6a4a41-2aba-409c-9481-aad45c59ee55" />
 
 
