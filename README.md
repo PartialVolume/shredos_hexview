@@ -5,11 +5,19 @@ Hex/ascii viewer for ShredOS
 
 #### Debian/Ubuntu
 ```
-sudo apt install libncurses-dev
+sudo apt install \
+  build-essential \
+  pkg-config \
+  automake \
+  libncurses-dev
 ```
 #### Fedora / RHEL / CentOS
 ```
-sudo dnf install ncurses-devel
+sudo bash
+sudo dnf update -y
+sudo dnf groupinstall -y "Development Tools" "C Development Tools and Libraries"
+sudo dnf install -y \
+  ncurses-devel
 ```
 #### then
 ```
